@@ -1,0 +1,377 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------- Helpers & Identity -------------------------
+    // Auth helper
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Fetch caller user doc once. Try to minimize repeated get() calls by
+    // using this cached helper across other helpers. Use Auth custom claims
+    // for high-frequency checks in production if possible.
+    function callerUser() {
+      return isSignedIn() ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data : null;
+    }
+
+    // Basic role checks (users/{uid}.role is source-of-truth)
+    function hasRole(role) {
+      return isSignedIn() && callerUser() != null && callerUser().role == role;
+    }
+
+    function isAdmin() { return hasRole('admin'); }
+    function isFaculty() { return hasRole('faculty'); }
+    function isHod() { return hasRole('hod'); }
+    function isStudent() { return hasRole('student'); }
+
+    // Active account check
+    function isActiveUser(uid) {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(uid)).data.isDisabled != true;
+    }
+
+    // Assignment helpers: fetch assignment doc and verify ownership. These
+    // are used sparingly to reduce get() cost — call only when needed.
+    function getAssignment(aid) {
+      return aid != null ? get(/databases/$(database)/documents/faculty_assignments/$(aid)).data : null;
+    }
+
+    function isAssignmentOwner(aid) {
+      return isSignedIn() && aid != null && getAssignment(aid) != null && getAssignment(aid).facultyUid == request.auth.uid;
+    }
+
+    // Check if caller belongs to a class (user doc normalization may vary)
+    function callerInClass(classId) {
+      return callerUser() != null && classId != null && ((callerUser().classIds != null && classId in callerUser().classIds) || (callerUser().classId != null && callerUser().classId == classId));
+    }
+
+    // Department scope helper
+    function sameDepartment(targetDeptId) {
+      return callerUser() != null && targetDeptId != null && (callerUser().departmentId == targetDeptId || callerUser().department == targetDeptId);
+    }
+
+    // Compatibility helper
+    function isAuthenticated() { return isSignedIn(); }
+
+
+    /* ------------------------- users collection ------------------------- */
+    match /users/{userId} {
+      // Read:
+      // - users may read their own profile
+      // - admins may read any profile
+      // - faculty may read profiles in their department (required for attendance workflows)
+      allow read: if isSignedIn() && (
+        request.auth.uid == userId ||
+        isAdmin() ||
+        (isFaculty() && resource.data.departmentId == callerUser().departmentId)
+      );
+
+      // Create: allow when an admin creates users or user creates own profile
+      allow create: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+
+      // Update: users can update their own profile (limited fields); admins can update any profile.
+      // Prevent non-admins from escalating role or toggling disabled status.
+      allow update: if isSignedIn() && (
+        request.auth.uid == userId || isAdmin()
+      ) && (
+        (request.resource.data.role == resource.data.role) || isAdmin()
+      ) && (
+        (request.resource.data.isDisabled == resource.data.isDisabled) || isAdmin()
+      );
+
+      // Delete: only admins may delete user documents
+      allow delete: if isAdmin();
+    }
+
+    /* ------------------------- attendance collection ------------------------- */
+    match /attendance/{attendanceId} {
+      // Read: Students, faculty and admins can read attendance records.
+      // - Students: only for classes they belong to (callerUser.classIds)
+      // - Faculty: if they are assigned to the subject or in the same department
+      // We must use resource.data for single-doc reads; collection queries should be
+      // constrained on the client to avoid exposing unrelated records.
+      // Read: students may read attendance for their class; faculty may read
+      // attendance for subjects/classes they are assigned to; admins may read all.
+      allow get: if isSignedIn() && (
+        isAdmin() ||
+        (isFaculty() && (
+          (resource.data.assignmentId != null && isAssignmentOwner(resource.data.assignmentId)) ||
+          sameDepartment(resource.data.departmentId)
+        )) ||
+        (isHod() && (resource.data.departmentId != null && (callerUser().departmentId == resource.data.departmentId || (callerUser().assignedDepartments != null && resource.data.departmentId in callerUser().assignedDepartments)))) ||
+        (isStudent() && callerInClass(resource.data.classId))
+      );
+
+      // List (queries): allow only authenticated reads; APPLICATION SHOULD constrain
+      // queries (e.g. filter by classId or subjectId). Firestore rules cannot fully
+      // emulate complex joins; prefer query scoping on the client and verify in cloud
+      // functions when necessary.
+      allow list: if isSignedIn();
+
+      // Create: only faculty and admins can create attendance records
+      // Create: faculty may create attendance sessions only for their assignments
+      allow create: if isSignedIn() && (
+        isAdmin() || (
+          isFaculty() && (
+            // either assignmentId present and caller owns it or facultyId equals caller
+            (request.resource.data.assignmentId != null && isAssignmentOwner(request.resource.data.assignmentId)) || (request.resource.data.facultyId == request.auth.uid)
+          )
+        )
+      ) && request.resource.data.createdBy == request.auth.uid;
+
+      // Update: only faculty who created the record or admins can update
+      allow update: if isSignedIn() && (
+        isAdmin() || (isFaculty() && resource.data.createdBy == request.auth.uid)
+      );
+
+      // Delete: only admins can delete attendance records
+      allow delete: if isAdmin();
+    }
+
+    /* ------------------------- announcements collection ------------------------- */
+    match /announcements/{announcementId} {
+      // Read: announcements are readable by authenticated users
+      allow read: if isSignedIn();
+
+      // Create: faculty and admins can create announcements (admins have full control)
+      // HODs may also create department-scoped announcements for their departments
+      allow create: if isSignedIn() && (
+        (isFaculty() || isAdmin() || isHod()) && request.resource.data.authorUid == request.auth.uid
+        && (
+          // if department-scoped, ensure HOD/author is in that department
+          request.resource.data.scope != 'department' || (request.resource.data.targetIds != null && (callerUser().departmentId == request.resource.data.targetIds[0] || (callerUser().assignedDepartments != null && request.resource.data.targetIds[0] in callerUser().assignedDepartments)))
+        )
+      );
+
+      // Update/Delete: authors and admins can modify/remove announcements
+      allow update, delete: if isSignedIn() && (
+        isAdmin() || resource.data.authorUid == request.auth.uid
+      );
+    }
+
+    /* ------------------------- notes collection ------------------------- */
+    match /notes/{noteId} {
+      // Read: notes can be accessed if visibility rules allow.
+      // Read: enforce visibility rules and department/class scoping. Students may read
+      // notes targeted at their class/department; faculty may read department/class notes.
+      allow get: if isSignedIn() && (
+        isAdmin() ||
+        resource.data.uploadedBy == request.auth.uid ||
+        resource.data.visibility == 'public' ||
+        (resource.data.visibility == 'department' && sameDepartment(resource.data.departmentId)) ||
+        (resource.data.visibility == 'class' && callerInClass(resource.data.classId))
+      );
+
+      // List: general authenticated read allowed; client should constrain queries by
+      // departmentId/subjectId/visibility. Consider using Cloud Functions to mediate
+      // complex access patterns.
+      allow list: if isSignedIn();
+
+      // Create: only faculty and admins can upload notes; enforce uploadedBy claim
+      // Create: faculty may upload notes. If a note references an assignmentId ensure
+      // the uploader owns that assignment (prevents forging class/subject relations).
+      allow create: if isSignedIn() && (isFaculty() || isAdmin()) && request.resource.data.uploadedBy == request.auth.uid && (
+        request.resource.data.assignmentId == null || isAssignmentOwner(request.resource.data.assignmentId)
+      );
+
+      // Update: uploader or admin may update metadata (but not change uploadedBy)
+      allow update: if isSignedIn() && (
+        isAdmin() || (resource.data.uploadedBy == request.auth.uid && request.resource.data.uploadedBy == resource.data.uploadedBy)
+      );
+
+      // Delete: uploader or admin
+      allow delete: if isSignedIn() && (isAdmin() || resource.data.uploadedBy == request.auth.uid);
+    }
+
+    /* ------------------------- timetable collection ------------------------- */
+    match /timetable/{slotId} {
+      // Readable by authenticated users. Clients should scope queries by classId/sectionId/day.
+      allow read: if isSignedIn();
+
+      // Create: admins can create; faculty may create only when they own the referenced assignment
+      // HODs may create slots for their departments
+      // and the slot's class/section/subject match the assignment. This minimizes trust in client payloads.
+      allow create: if isSignedIn() && (
+        isAdmin() || (
+          isFaculty() && (
+            request.resource.data.assignmentId != null && isAssignmentOwner(request.resource.data.assignmentId)
+            && request.resource.data.facultyUid == request.auth.uid
+            // ensure class/section/subject normalized to assignment
+            && request.resource.data.classId == getAssignment(request.resource.data.assignmentId).classId
+            && (getAssignment(request.resource.data.assignmentId).sectionId == null || request.resource.data.sectionId == getAssignment(request.resource.data.assignmentId).sectionId)
+            && request.resource.data.subjectId == getAssignment(request.resource.data.assignmentId).subjectId
+          )
+        ) || (
+          isHod() && (request.resource.data.departmentId != null && (callerUser().departmentId == request.resource.data.departmentId || (callerUser().assignedDepartments != null && request.resource.data.departmentId in callerUser().assignedDepartments)))
+        )
+      );
+
+      // Update: admins or assignment owner (if slot references assignment)
+      allow update: if isSignedIn() && (
+        isAdmin() || (
+          isFaculty() && (
+            resource.data.assignmentId != null && isAssignmentOwner(resource.data.assignmentId) && resource.data.facultyUid == request.auth.uid
+          )
+        ) || (
+          isHod() && (resource.data.departmentId != null && (callerUser().departmentId == resource.data.departmentId || (callerUser().assignedDepartments != null && resource.data.departmentId in callerUser().assignedDepartments)))
+        )
+      );
+
+      // Delete: admins only (avoid accidental removals that break schedules)
+      allow delete: if isAdmin();
+    }
+
+    /* ------------------------- subjects collection ------------------------- */
+    match /subjects/{subjectId} {
+      // Readable by everyone authenticated
+      allow read: if isSignedIn();
+
+      // Create/Update/Delete: admin only
+      allow create, update, delete: if isAdmin();
+    }
+
+    /* ------------------------- departments collection ------------------------- */
+    match /departments/{deptId} {
+      // Read: authenticated users
+      allow read: if isSignedIn();
+
+      // Manage departments: admins only
+      allow create, update, delete: if isAdmin();
+    }
+
+    /* ------------------------- attendance_sessions collection ------------------------- */
+    match /attendance_sessions/{sessionId} {
+      // Helper: validate basic session shape where possible.
+      function validateSessionShape(resourceData) {
+        return resourceData.subjectId is string
+          && resourceData.facultyId is string
+          && resourceData.departmentId is string
+          && (resourceData.year is string || resourceData.year is number)
+          && resourceData.date is string
+          && resourceData.students is list
+          // Limit students array to reasonable size to avoid abuse
+          && resourceData.students.size() <= 1000
+          // createdAt should be a timestamp (serverTimestamp is allowed)
+          && resourceData.createdAt is timestamp;
+      }
+
+      // Read: authenticated users can read sessions.
+      // Students: can read sessions for their department/year only.
+      // Faculty: can read sessions for their department; admins can read all.
+      allow get: if isAuthenticated() && (
+        isAdmin() ||
+        (isStudent() && resource.data.departmentId == callerUser().departmentId && String(resource.data.year) == String(callerUser().year)) ||
+        (isFaculty() && (
+          // allow faculty if they created session or if it ties to an assignment they own
+          resource.data.facultyId == request.auth.uid || (resource.data.assignmentId != null && isAssignmentOwner(resource.data.assignmentId)) || resource.data.departmentId == callerUser().departmentId
+        ))
+      );
+
+      // List: allow authenticated reads but clients MUST scope queries by
+      // department/year/subject to avoid returning broad datasets.
+      allow list: if isAuthenticated();
+
+      // Create: admins and faculty can create. If faculty is creating a session
+      // enforce that `facultyId` equals request.auth.uid. Validate payload shape.
+      // Create: admins or faculty who own the assignment referenced in the session
+      allow create: if isAuthenticated() && (
+        isAdmin() || (
+          isFaculty() && (
+            (request.resource.data.assignmentId != null && isAssignmentOwner(request.resource.data.assignmentId)) || request.resource.data.facultyId == request.auth.uid
+          )
+        )
+      ) && validateSessionShape(request.resource.data);
+
+      // Update: admins or the faculty that created the session may update.
+      // Validate updated shape as well.
+      allow update: if isAuthenticated() && (
+        isAdmin() || (isFaculty() && resource.data.facultyId == request.auth.uid)
+      ) && validateSessionShape(request.resource.data);
+
+      // Delete: only admins may delete sessions
+      allow delete: if isAdmin();
+    }
+
+    /* ------------------------- fallback: deny everything else ------------------------- */
+    /* ------------------------- faculty_assignments collection ------------------------- */
+    match /faculty_assignments/{assignId} {
+      // Admins manage assignments. Faculty may read their own assignments.
+      // HODs may manage assignments scoped to their department(s).
+      allow read: if isSignedIn() && (isAdmin() || resource.data.facultyUid == request.auth.uid || (isHod() && sameDepartment(resource.data.departmentId)));
+      allow create, update, delete: if isSignedIn() && (
+        isAdmin() || (isHod() && (request.resource.data.departmentId != null && (callerUser().departmentId == request.resource.data.departmentId || (callerUser().assignedDepartments != null && request.resource.data.departmentId in callerUser().assignedDepartments))))
+      );
+    }
+
+    /* ------------------------- results collection ------------------------- */
+    match /results/{resultId} {
+      // Read: student may read own results; faculty may read results for their assignments; admins can read all
+      allow get: if isSignedIn() && (
+        isAdmin() || (isStudent() && resource.data.studentId == request.auth.uid) || (isFaculty() && (
+          resource.data.assignmentId != null && isAssignmentOwner(resource.data.assignmentId)
+        )) || (isHod() && resource.data.departmentId != null && (callerUser().departmentId == resource.data.departmentId || (callerUser().assignedDepartments != null && resource.data.departmentId in callerUser().assignedDepartments)))
+      );
+
+      allow list: if isSignedIn();
+
+      // Create: faculty can create results only when they own the referenced assignment and match normalized class/section
+      // HODs may create/modify results scoped to their department(s)
+      allow create: if isSignedIn() && (
+        isAdmin() || (
+          isFaculty() && request.resource.data.assignmentId != null && isAssignmentOwner(request.resource.data.assignmentId) && request.resource.data.facultyId == request.auth.uid && request.resource.data.classId == getAssignment(request.resource.data.assignmentId).classId && (getAssignment(request.resource.data.assignmentId).sectionId == null || request.resource.data.sectionId == getAssignment(request.resource.data.assignmentId).sectionId)
+        ) || (
+          isHod() && request.resource.data.departmentId != null && (callerUser().departmentId == request.resource.data.departmentId || (callerUser().assignedDepartments != null && request.resource.data.departmentId in callerUser().assignedDepartments))
+        )
+      );
+
+      // Update/Delete: admin OR assignment owner (faculty) who created/owns the result; HODs may manage department results
+      allow update, delete: if isSignedIn() && (
+        isAdmin() || (isFaculty() && resource.data.assignmentId != null && isAssignmentOwner(resource.data.assignmentId) && resource.data.facultyId == request.auth.uid) || (isHod() && resource.data.departmentId != null && (callerUser().departmentId == resource.data.departmentId || (callerUser().assignedDepartments != null && resource.data.departmentId in callerUser().assignedDepartments)))
+      );
+    }
+
+    /* ------------------------- complaints collection ------------------------- */
+    match /complaints/{complaintId} {
+      allow read: if isSignedIn() && (
+        isAdmin() || resource.data.submittedBy == request.auth.uid || (isFaculty() && sameDepartment(resource.data.departmentId))
+      );
+      allow create: if isSignedIn() && request.resource.data.submittedBy == request.auth.uid;
+      allow update, delete: if isSignedIn() && (isAdmin() || resource.data.submittedBy == request.auth.uid);
+    }
+
+    /* ------------------------- audit_logs collection ------------------------- */
+    match /audit_logs/{logId} {
+      // Audit logs are immutable. Prefer server-side creation via Cloud Functions
+      // (Admin SDK) which bypasses rules. Clients may write fallback entries
+      // marked with `clientGenerated=true` that can be filtered by auditors.
+      allow create: if isSignedIn() && (
+        // Admins can always create/read; clients may create only their own
+        isAdmin() || (request.resource.data.clientGenerated == true && request.resource.data.actorUid == request.auth.uid)
+      );
+
+      // Read: admins may read all audit logs. Optionally allow actors to read their own logs.
+      allow get: if isSignedIn() && (isAdmin() || request.auth.uid == resource.data.actorUid);
+      allow list: if isSignedIn() && isAdmin();
+
+      // Prevent updates/deletes from clients — only system processes (Admin SDK)
+      // should modify or delete audit entries. The Admin SDK bypasses rules.
+      allow update, delete: if false;
+    }
+
+    /* ------------------------- fallback: deny everything else ------------------------- */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+
+// Notes & recommendations:
+// - This ruleset relies on `users/{uid}.role` as the source of truth. For
+//   high-frequency role checks consider using Firebase Auth custom claims to avoid
+//   the single get() call per request.
+// - Collection query restrictions (list) are intentionally permissive but the
+//   client MUST scope queries (filter by `classId`, `departmentId`, or `subjectId`) to
+//   avoid returning large unrelated datasets. Firestore rules cannot fully
+//   implement complex join logic for list queries; validate sensitive queries via
+//   Cloud Functions when necessary.
+// - Audit critical admin actions via server-side logging / `auditLogs` collection.
